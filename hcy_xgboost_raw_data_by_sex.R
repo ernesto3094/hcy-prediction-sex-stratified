@@ -1,0 +1,392 @@
+# ==========================================================
+# XGBoost model for HCY prediction
+# This script can be used for either the male or female dataset.
+#
+# Important methodological note:
+# In this model, raw data without transformation, centering, or scaling
+# are used because tree-based boosting models such as XGBoost can handle
+# nonlinear relationships, interactions, and variables measured on
+# different scales.
+#
+# Protocol:
+# - Raw dataset without preprocessing transformations
+# - 80/20 stratified train-test split based on HCY quintiles
+# - 10-fold cross-validation applied only within the training set
+# - Hyperparameter tuning of XGBoost
+# - Final evaluation on the independent test set
+# ==========================================================
+
+# ------------------------------
+# 1. Load required libraries
+# ------------------------------
+library(tidyverse)
+library(caret)
+library(xgboost)
+library(readr)
+
+# ------------------------------
+# 2. Define the study group and load the raw dataset
+# ------------------------------
+
+# Use "Men" when analyzing the male dataset.
+# Use "Women" when analyzing the female dataset.
+group_label <- "Men"
+
+# Load the raw dataset.
+# No transformation, centering, or scaling is applied for XGBoost.
+#
+# Example for men:
+# "~/dataset_genero_2_sin_HcyABN3.csv"
+#
+# Example for women:
+# "~/dataset_genero_1_sin_HcyABN3.csv"
+input_dataset_path <- "~/dataset_genero_2_sin_HcyABN3.csv"
+
+data <- read_csv(input_dataset_path, show_col_types = FALSE)
+
+cat("\nRaw dataset loaded for the", group_label, "group.\n")
+cat("Input dataset path:", input_dataset_path, "\n")
+cat("Number of observations:", nrow(data), "\n")
+cat("Number of variables:", ncol(data), "\n")
+
+# ------------------------------
+# 3. Exclude variables not included in the predictive analysis
+# ------------------------------
+
+# These variables are excluded because they correspond to epigenetic variables,
+# auxiliary categorical variables, or variables not considered in this model.
+excluded_variables <- c(
+  "ALU", "LINE", "SAT", "HcyABN3",
+  "GrasaCatFem", "GrasaCatMasc"
+)
+
+data <- data %>%
+  select(-any_of(excluded_variables))
+
+# Display the predictors used in the model
+predictor_variables <- setdiff(names(data), "HCY")
+
+cat("\nPredictor variables used for the", group_label, "dataset:\n")
+print(predictor_variables)
+
+# Check that the response variable exists
+if (!"HCY" %in% names(data)) {
+  stop("The response variable 'HCY' was not found in the dataset.")
+}
+
+# ------------------------------
+# 4. Create HCY levels for stratification using quintiles
+# ------------------------------
+
+# HCY is divided into quintiles to preserve the response distribution
+# in both training and testing subsets.
+hcy_cut_points <- unique(
+  quantile(
+    data$HCY,
+    probs = seq(0, 1, 0.2),
+    na.rm = TRUE
+  )
+)
+
+if (length(hcy_cut_points) < 3) {
+  stop("Not enough distinct cut points could be generated for HCY stratification.")
+}
+
+data$HCY_level <- cut(
+  data$HCY,
+  breaks = hcy_cut_points,
+  include.lowest = TRUE,
+  labels = FALSE
+)
+
+cat("\nOverall distribution of HCY levels:\n")
+print(table(data$HCY_level))
+
+cat("\nOverall proportions of HCY levels:\n")
+print(round(prop.table(table(data$HCY_level)), 3))
+
+# ------------------------------
+# 5. Create an 80/20 stratified train-test split
+# ------------------------------
+
+# The split is performed within each HCY level to preserve
+# approximately 80% of observations for training and 20% for testing.
+set.seed(123)
+
+index_by_level <- split(seq_len(nrow(data)), data$HCY_level)
+
+train_index <- unlist(
+  lapply(index_by_level, function(index) {
+    n_train <- round(length(index) * 0.80)
+    sample(index, size = n_train)
+  })
+)
+
+train_index <- sort(train_index)
+
+train_data <- data[train_index, ]
+test_data  <- data[-train_index, ]
+
+cat("\nNumber of observations in the training set:", nrow(train_data), "\n")
+cat("Number of observations in the testing set :", nrow(test_data), "\n")
+
+cat("\nDistribution of HCY levels in the training set:\n")
+print(table(train_data$HCY_level))
+
+cat("\nDistribution of HCY levels in the testing set:\n")
+print(table(test_data$HCY_level))
+
+cat("\nPercentage of each HCY level assigned to the training set:\n")
+print(round(100 * table(train_data$HCY_level) / table(data$HCY_level), 2))
+
+cat("\nPercentage of each HCY level assigned to the testing set:\n")
+print(round(100 * table(test_data$HCY_level) / table(data$HCY_level), 2))
+
+cat("\nInternal proportions of HCY levels in the training set:\n")
+print(round(prop.table(table(train_data$HCY_level)), 3))
+
+cat("\nInternal proportions of HCY levels in the testing set:\n")
+print(round(prop.table(table(test_data$HCY_level)), 3))
+
+# ------------------------------
+# 6. Remove the auxiliary stratification variable
+# ------------------------------
+
+# HCY_level is used only for stratified splitting.
+# It must not be included as a predictor.
+train_data$HCY_level <- NULL
+test_data$HCY_level  <- NULL
+
+# Remove rows with missing values, if present.
+train_data <- na.omit(train_data)
+test_data  <- na.omit(test_data)
+
+cat("\nFinal number of observations in train_data:", nrow(train_data), "\n")
+cat("Final number of observations in test_data :", nrow(test_data), "\n")
+
+# ------------------------------
+# 7. Configure cross-validation only within the training set
+# ------------------------------
+
+training_control <- trainControl(
+  method = "cv",
+  number = 10
+)
+
+# ------------------------------
+# 8. Define the XGBoost hyperparameter grid
+# ------------------------------
+
+xgboost_grid <- expand.grid(
+  nrounds = c(100, 300, 500),
+  max_depth = c(2, 3, 5),
+  eta = c(0.01, 0.05, 0.1),
+  gamma = c(0, 1),
+  colsample_bytree = c(0.6, 0.8),
+  min_child_weight = c(1, 3, 5),
+  subsample = c(0.7, 1.0)
+)
+
+cat("\nTotal number of hyperparameter combinations to evaluate:", nrow(xgboost_grid), "\n")
+
+# ------------------------------
+# 9. Evaluate each hyperparameter combination
+# ------------------------------
+
+results <- data.frame()
+saved_models <- list()
+
+for (i in seq_len(nrow(xgboost_grid))) {
+  
+  current_parameters <- xgboost_grid[i, , drop = FALSE]
+  
+  cat("\n====================================\n")
+  cat("Evaluating combination", i, "of", nrow(xgboost_grid), "\n")
+  print(current_parameters)
+  cat("====================================\n")
+  
+  set.seed(123)
+  
+  xgboost_model <- train(
+    HCY ~ .,
+    data = train_data,
+    method = "xgbTree",
+    trControl = training_control,
+    tuneGrid = current_parameters,
+    metric = "RMSE",
+    verbose = FALSE
+  )
+  
+  # Generate predictions
+  train_predictions <- predict(xgboost_model, newdata = train_data)
+  test_predictions  <- predict(xgboost_model, newdata = test_data)
+  
+  # Compute performance metrics
+  train_metrics <- postResample(
+    pred = train_predictions,
+    obs = train_data$HCY
+  )
+  
+  test_metrics <- postResample(
+    pred = test_predictions,
+    obs = test_data$HCY
+  )
+  
+  # Cross-validation results for the evaluated combination
+  cv_row <- xgboost_model$results[1, ]
+  
+  results <- rbind(
+    results,
+    data.frame(
+      model_id = i,
+      nrounds = current_parameters$nrounds,
+      max_depth = current_parameters$max_depth,
+      eta = current_parameters$eta,
+      gamma = current_parameters$gamma,
+      colsample_bytree = current_parameters$colsample_bytree,
+      min_child_weight = current_parameters$min_child_weight,
+      subsample = current_parameters$subsample,
+      CV_RMSE = cv_row$RMSE,
+      CV_Rsquared = cv_row$Rsquared,
+      CV_MAE = cv_row$MAE,
+      TRAIN_RMSE = unname(train_metrics["RMSE"]),
+      TRAIN_Rsquared = unname(train_metrics["Rsquared"]),
+      TRAIN_MAE = unname(train_metrics["MAE"]),
+      TEST_RMSE = unname(test_metrics["RMSE"]),
+      TEST_Rsquared = unname(test_metrics["Rsquared"]),
+      TEST_MAE = unname(test_metrics["MAE"])
+    )
+  )
+  
+  saved_models[[paste0("model_", i)]] <- xgboost_model
+}
+
+# ------------------------------
+# 10. Select the best model based on cross-validation performance
+# ------------------------------
+
+# For methodological consistency, the best hyperparameter combination
+# is selected using cross-validation results from the training set.
+# The independent test set is used only for final evaluation.
+ordered_results <- results[order(results$CV_RMSE, -results$CV_Rsquared), ]
+
+cat("\n=============================\n")
+cat("RESULTS ORDERED BY CROSS-VALIDATION RMSE\n")
+cat("=============================\n")
+print(ordered_results)
+
+# ------------------------------
+# 11. Best hyperparameter combination according to cross-validation
+# ------------------------------
+
+best_result <- ordered_results[1, ]
+
+cat("\n=============================\n")
+cat("BEST HYPERPARAMETERS ACCORDING TO CROSS-VALIDATION\n")
+cat("=============================\n")
+print(best_result)
+
+best_model_id <- best_result$model_id
+best_model <- saved_models[[paste0("model_", best_model_id)]]
+
+cat("\nBest hyperparameter combination according to cross-validation:\n")
+cat("nrounds =", best_result$nrounds, "\n")
+cat("max_depth =", best_result$max_depth, "\n")
+cat("eta =", best_result$eta, "\n")
+cat("gamma =", best_result$gamma, "\n")
+cat("colsample_bytree =", best_result$colsample_bytree, "\n")
+cat("min_child_weight =", best_result$min_child_weight, "\n")
+cat("subsample =", best_result$subsample, "\n")
+
+cat("\nCross-validation performance of the selected model:\n")
+cat("CV_RMSE     =", round(best_result$CV_RMSE, 6), "\n")
+cat("CV_Rsquared =", round(best_result$CV_Rsquared, 6), "\n")
+cat("CV_MAE      =", round(best_result$CV_MAE, 6), "\n")
+
+cat("\nIndependent test-set performance of the selected model:\n")
+cat("TEST_RMSE     =", round(best_result$TEST_RMSE, 6), "\n")
+cat("TEST_Rsquared =", round(best_result$TEST_Rsquared, 6), "\n")
+cat("TEST_MAE      =", round(best_result$TEST_MAE, 6), "\n")
+
+# ------------------------------
+# 12. Final summary
+# ------------------------------
+
+final_summary <- data.frame(
+  Model = "XGBoost",
+  Group = group_label,
+  nrounds = best_result$nrounds,
+  max_depth = best_result$max_depth,
+  eta = best_result$eta,
+  gamma = best_result$gamma,
+  colsample_bytree = best_result$colsample_bytree,
+  min_child_weight = best_result$min_child_weight,
+  subsample = best_result$subsample,
+  CV_RMSE = best_result$CV_RMSE,
+  CV_Rsquared = best_result$CV_Rsquared,
+  CV_MAE = best_result$CV_MAE,
+  TEST_RMSE = best_result$TEST_RMSE,
+  TEST_Rsquared = best_result$TEST_Rsquared,
+  TEST_MAE = best_result$TEST_MAE
+)
+
+cat("\n=============================\n")
+cat("FINAL SUMMARY: CROSS-VALIDATION VS TEST SET\n")
+cat("=============================\n")
+print(final_summary)
+
+# ------------------------------
+# 13. Variable importance of the selected model
+# ------------------------------
+
+xgboost_importance <- varImp(
+  best_model,
+  scale = FALSE
+)
+
+ordered_xgboost_importance <- xgboost_importance$importance %>%
+  arrange(desc(Overall))
+
+cat("\nTop 20 most important variables according to the selected XGBoost model:\n")
+print(head(ordered_xgboost_importance, 20))
+
+# ------------------------------
+# 14. Save results
+# ------------------------------
+
+results_file <- paste0(
+  "xgboost_hyperparameter_results_",
+  tolower(group_label),
+  ".csv"
+)
+
+summary_file <- paste0(
+  "xgboost_selected_model_summary_",
+  tolower(group_label),
+  ".csv"
+)
+
+importance_file <- paste0(
+  "xgboost_variable_importance_",
+  tolower(group_label),
+  ".csv"
+)
+
+write_csv(results, results_file)
+write_csv(final_summary, summary_file)
+write_csv(ordered_xgboost_importance, importance_file)
+
+cat("\nXGBoost hyperparameter results saved as:", results_file, "\n")
+cat("Selected XGBoost model summary saved as:", summary_file, "\n")
+cat("XGBoost variable importance saved as:", importance_file, "\n")
+
+# ------------------------------
+# 15. Display and plot the selected model
+# ------------------------------
+
+print(best_model)
+
+plot(
+  best_model,
+  main = paste("XGBoost tuning results -", group_label, "dataset")
+)
